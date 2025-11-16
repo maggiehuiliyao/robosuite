@@ -94,7 +94,7 @@ def main():
     # Add visualization wrapper with green indicator
     indicator_config = {
         "name": "target",
-        "type": "sphere",
+        "type": None,
         "size": [0.02],
         "rgba": [0, 1, 0, 0.7]  # Green
     }
@@ -107,13 +107,30 @@ def main():
         device='cuda',
         use_language=False
     )
-    env = VisualizationWrapper(env, indicator_configs=indicator_config)
+    # env = VisualizationWrapper(env, indicator_configs=[])
 
     obs = env.reset()
+
+    # Now move the cube
+    cube_joint_id = env.sim.model.joint_name2id('cube_joint0')
+    qpos_addr = env.sim.model.jnt_qposadr[cube_joint_id]
+    env.sim.data.qpos[qpos_addr] -= 0.1
+    env.sim.data.qpos[qpos_addr + 1] += 0.1
+    env.sim.forward()
+
+    # Force camera observations to update
+    for cam_name in env.camera_names:
+        env.sim.render(
+            camera_name=cam_name,
+            width=env.camera_widths[0],
+            height=env.camera_heights[0],
+            depth=True
+        )
+
+    # Get fresh observations
+    obs = env._get_observations(force_update=True)
     env.render()
-
     # i'm doing this shit myself wtf
-
     # loading in all the data values
     data = {}
     rgb_raw = obs["agentview_image"]  # (H, W, 3)
@@ -128,9 +145,17 @@ def main():
     pcd_raw = pcd_raw.reshape(-1, 3)  # (H*W, 3)
     rgb_raw = rgb_raw.reshape(-1, 3)  # (H*W, 3)
 
-    bounds = get_table_bounds(env)
-    pcd_raw, rgb_raw = filter_point_cloud_workspace(pcd_raw, rgb_raw, bounds)
+    # bounds = get_table_bounds(env)
+    # pcd_raw, rgb_raw = filter_point_cloud_workspace(pcd_raw, rgb_raw, bounds)
+    pcd_raw = pcd_raw.reshape(-1, 3)   # (H*W, 3)
+    rgb_raw = rgb_raw.reshape(-1, 3)   # (H*W, 3)
 
+    # Create mask for points with z ≤ 1
+    mask = pcd_raw[:, 2] <= 1.5
+
+    # Apply mask
+    pcd_raw = pcd_raw[mask]
+    rgb_raw = rgb_raw[mask]
     # copied directly from rlbench
     rgb = normalize_rgb(rgb_raw[:, None]).squeeze(2).T
     pcd = torch.from_numpy(pcd_raw).float()
@@ -141,7 +166,7 @@ def main():
             'points': pcd,
             'task': 'pick'
         }
-    
+    print("pointcloud mean: ", pcd.mean(dim=0))
     data['cam_pose'] = torch.from_numpy(cam_extrinsics).float()
     # model requires these fields even for pick task (uses dummy data like M2T2 dataset.py:100-106)
     data['object_inputs'] = torch.rand(1024, 6)
@@ -151,9 +176,15 @@ def main():
 
 
     ############### ONLY OPERATE HERE ################
-
+    import os
+    debug_dir = "/home/maggie/research/robosuite/debug"
+    os.makedirs(debug_dir, exist_ok=True)
+    np.save(f"{debug_dir}/xyz.npy", pcd)
+    np.save(f"{debug_dir}/rgb.npy", rgb)
+    np.save(f"{debug_dir}/depth.npy", obs[f"{args.camera}_depth"])
+    np.save(f"{debug_dir}/rgb_image.npy", obs[f"{args.camera}_image"])
     # Calculate center offset (used to center the point cloud)
-    center_offset = pcd.mean(dim=0)
+    # center_offset = pcd.mean(dim=0)
 
     # Batch the data
     data_batch = m2t2.collate([data])
@@ -209,11 +240,15 @@ def main():
     if len(all_grasps) > 0:
         best_idx = np.argmax(all_confidences)
         grasp_pose = all_grasps[best_idx].copy()
+        print("for maggie: ", grasp_pose[:3, 3])
+        # grasp_pose = cam_extrinsics @ grasp_pose
+    
         confidence = all_confidences[best_idx]
 
         # Transform from centered world frame to actual world frame
         # Add center_offset to translation component
-        grasp_pose[:3, 3] += center_offset.cpu().numpy()
+        # print("Center offset:", center_offset)
+        # grasp_pose[:3, 3] += center_offset.cpu().numpy()
 
         print(f"\n✓ Found {len(all_grasps)} grasps, selected best with confidence: {confidence:.4f}")
     else:
@@ -230,12 +265,12 @@ def main():
 
     # target_pos[0] = 0.0  # x center
     # target_pos[1] = 0.0  # y center
-    target_pos[2] -= 1.1  # 9cm above cube
+    # target_pos[2] -= 1.1  # 9cm above cube
 
     print(f"Moving to: {target_pos}")
 
     # Set indicator to target position
-    env.set_indicator_pos("target", target_pos)
+    # env.set_indicator_pos("target", target_pos)
 
     # Control loop - move to target position
     for step in range(500):

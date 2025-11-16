@@ -35,7 +35,7 @@ def get_table_bounds(env, margin=0.05):
     table_pos = env.sim.data.body_xpos[table_body_id]
 
     # Get table size (assume square table, hardcode for Lift task)
-    table_half_size = 0.4
+    table_half_size = 2.5
 
     bounds = np.array([
         [table_pos[0] - table_half_size, table_pos[0] + table_half_size],  # x
