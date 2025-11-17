@@ -181,7 +181,8 @@ class SpaceMouse(Device):
 
     def _auto_detect_device(self):
         """Auto-detect and connect to first 3Dconnexion device."""
-        devices = [d for d in hid.enumerate() if d.get("manufacturer_string") == "3Dconnexion"]
+        # 3Dconnexion vendor ID is 0x256f
+        devices = [d for d in hid.enumerate() if d.get("vendor_id") == 0x256f]
         if not devices:
             raise OSError("No 3Dconnexion devices found")
 
@@ -189,7 +190,8 @@ class SpaceMouse(Device):
         self.device.open_path(selected["path"])
         self.vendor_id = selected["vendor_id"]
         self.product_id = selected["product_id"]
-        ROBOSUITE_DEFAULT_LOGGER.info(f"Auto-detected: {selected['product_string']} with path {selected['path']}")
+        product_name = selected.get('product_string') or f"Device {selected['product_id']:04x}"
+        ROBOSUITE_DEFAULT_LOGGER.info(f"Auto-detected: {product_name} with path {selected['path']}")
 
     @staticmethod
     def _display_controls():

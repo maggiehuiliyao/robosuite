@@ -15,6 +15,7 @@ from scipy.spatial.transform import Rotation as R
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 import robosuite as suite
 from robosuite.wrappers import VisualizationWrapper
+from robosuite.devices import SpaceMouse
 
 normalize_rgb = transforms.Compose([
         transforms.ToTensor(),
@@ -99,6 +100,7 @@ def main():
         camera_depths=True,
         reward_shaping=True,
         control_freq=20,
+        ignore_done=True,
     )
 
     # Add visualization wrapper with green indicator
@@ -124,8 +126,8 @@ def main():
     # Get joint ID for cube
     cube_joint_id = env.sim.model.joint_name2id('cube_joint0')
     qpos_addr = env.sim.model.jnt_qposadr[cube_joint_id]
-    env.sim.data.qpos[qpos_addr + 0] -= 0.2   # x
-    env.sim.data.qpos[qpos_addr + 1] += 0.3   # y
+    env.sim.data.qpos[qpos_addr + 0] += 0.15   # x
+    env.sim.data.qpos[qpos_addr + 1] -= 0.1   # y
     angle_deg = np.random.uniform(0, 360)
     quat = R.from_euler('z', angle_deg, degrees=True).as_quat()  # [x,y,z,w]
     quat_mj = np.array([quat[3], quat[0], quat[1], quat[2]])
@@ -252,7 +254,7 @@ def main():
             best_idx = np.argmax(all_confidences)
             confidence = all_confidences[best_idx]
             print(confidence)
-            if confidence > 0.9:
+            if confidence > 0.93:
                 notFound = False
                 grasp_pose = all_grasps[best_idx].copy()
                 print("for maggie: ", grasp_pose[:3, 3])
@@ -276,7 +278,7 @@ def main():
         ori_error_quat = T.mat2quat(ori_error_mat)
         ori_error = T.quat2axisangle(ori_error_quat)
 
-        action = create_osc_action(pos_error * 5.0, ori_error * 2.0, gripper=1)
+        action = create_osc_action(pos_error * 5.0, ori_error * 2.0, gripper=-1)
 
         obs, reward, done, info = env.step(action)
         env.render()
@@ -285,13 +287,75 @@ def main():
             print(f"Reached target at step {step}")
             break
 
-    # Hold position
-    import time
-    while True:
-        action = create_osc_action(np.zeros(3), gripper=0)
-        env.step(action)
+    target_pos_lower = target_pos.copy()
+    target_pos_lower[2] -= 0.12
+
+    for step in range(200):
+        ee_pos = get_ee_position(env)
+        ee_ori = get_ee_orientation(env)
+
+        pos_error = target_pos_lower - ee_pos
+        ori_error_mat = target_ori @ ee_ori.T
+        ori_error_quat = T.mat2quat(ori_error_mat)
+        ori_error = T.quat2axisangle(ori_error_quat)
+
+        action = create_osc_action(pos_error * 5.0, ori_error * 2.0, gripper=-1)
+
+        obs, reward, done, info = env.step(action)
         env.render()
-        time.sleep(0.01)
+
+        if np.linalg.norm(pos_error) < 0.01:
+            print(f"Reached lower position at step {step}")
+            break
+
+    print("Closing gripper...")
+    for step in range(100):
+        action = create_osc_action(np.zeros(3), np.zeros(3), gripper=1)
+        obs, reward, done, info = env.step(action)
+        env.render()
+
+    # print("SpaceMouse control active (Ctrl+q to quit)...")
+    device = SpaceMouse(env=env, pos_sensitivity = 0.35, rot_sensitivity=0.35)
+    device.start_control()
+
+    all_prev_gripper_actions = [{f"{robot_arm}_gripper": np.repeat([0], robot.gripper[robot_arm].dof)
+                                 for robot_arm in robot.arms if robot.gripper[robot_arm].dof > 0}
+                                for robot in env.robots]
+
+    while True:
+        input_ac_dict = device.input2action()
+        if input_ac_dict is None:
+            break
+
+        from copy import deepcopy
+        action_dict = deepcopy(input_ac_dict)
+        active_robot = env.robots[device.active_robot]
+        if input_ac_dict is None:
+            break
+
+        from copy import deepcopy
+
+        action_dict = deepcopy(input_ac_dict)  # {}
+        # set arm actions
+        for arm in active_robot.arms:
+            controller_input_type = active_robot.part_controllers[arm].input_type
+
+            if controller_input_type == "delta":
+                action_dict[arm] = input_ac_dict[f"{arm}_delta"]
+            elif controller_input_type == "absolute":
+                action_dict[arm] = input_ac_dict[f"{arm}_abs"]
+            else:
+                raise ValueError
+
+        # Maintain gripper state for each robot but only update the active robot with action
+        env_action = [robot.create_action_vector(all_prev_gripper_actions[i]) for i, robot in enumerate(env.robots)]
+        env_action[device.active_robot] = active_robot.create_action_vector(action_dict)
+        env_action = np.concatenate(env_action)
+        for gripper_ac in all_prev_gripper_actions[device.active_robot]:
+            all_prev_gripper_actions[device.active_robot][gripper_ac] = action_dict[gripper_ac]
+
+        env.step(env_action)
+        env.render()
 
     env.close()
 
