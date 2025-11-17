@@ -171,8 +171,6 @@ def main():
     # Apply mask
     pcd_raw = pcd_raw[mask]
     rgb_raw = rgb_raw[mask]
-    # copied directly from rlbench
-   
 
 
     grasp_pose, notFound = None, True
@@ -258,7 +256,7 @@ def main():
                 notFound = False
                 grasp_pose = all_grasps[best_idx].copy()
                 print("for maggie: ", grasp_pose[:3, 3])
-            
+
                 print(f"\n✓ Found {len(all_grasps)} grasps, selected best with confidence: {confidence:.4f}")
 
 
@@ -290,7 +288,7 @@ def main():
     # Hold position
     import time
     while True:
-        action = create_osc_action(np.zeros(3), gripper=1)
+        action = create_osc_action(np.zeros(3), gripper=0)
         env.step(action)
         env.render()
         time.sleep(0.01)
