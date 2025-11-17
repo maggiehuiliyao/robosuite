@@ -9,7 +9,9 @@ import torch
 
 from robosuite.maggie.point_cloud_utils import extract_point_cloud_from_obs, filter_point_cloud_workspace, get_table_bounds, prepare_point_cloud_for_m2t2
 from robosuite.utils.camera_utils import get_camera_extrinsic_matrix, get_camera_intrinsic_matrix, get_real_depth_map
-
+import robosuite.utils.transform_utils as T
+import numpy as np
+from scipy.spatial.transform import Rotation as R
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 import robosuite as suite
 from robosuite.wrappers import VisualizationWrapper
@@ -37,6 +39,14 @@ def get_ee_position(env):
         if name in env.sim.model.site_names:
             site_id = env.sim.model.site_name2id(name)
             return env.sim.data.site_xpos[site_id].copy()
+    return None
+
+def get_ee_orientation(env):
+    possible_names = ['gripper0_grip_site', 'gripper0_right_grip_site', 'grip_site', 'ee_site']
+    for name in possible_names:
+        if name in env.sim.model.site_names:
+            site_id = env.sim.model.site_name2id(name)
+            return env.sim.data.site_xmat[site_id].reshape(3, 3).copy()
     return None
 
 def sample_points(xyz, num_points):
@@ -92,12 +102,12 @@ def main():
     )
 
     # Add visualization wrapper with green indicator
-    indicator_config = {
-        "name": "target",
-        "type": None,
-        "size": [0.02],
-        "rgba": [0, 1, 0, 0.7]  # Green
-    }
+    # indicator_config = {
+    #     "name": "target",
+    #     "type": None,
+    #     "size": [0.02],
+    #     "rgba": [0, 1, 0, 0.7]  # Green
+    # }
 
 
     # yaoyao
@@ -111,12 +121,17 @@ def main():
 
     obs = env.reset()
 
-    # Now move the cube
+    # Get joint ID for cube
     cube_joint_id = env.sim.model.joint_name2id('cube_joint0')
     qpos_addr = env.sim.model.jnt_qposadr[cube_joint_id]
-    env.sim.data.qpos[qpos_addr] -= 0.1
-    env.sim.data.qpos[qpos_addr + 1] += 0.1
+    env.sim.data.qpos[qpos_addr + 0] -= 0.2   # x
+    env.sim.data.qpos[qpos_addr + 1] += 0.3   # y
+    angle_deg = np.random.uniform(0, 360)
+    quat = R.from_euler('z', angle_deg, degrees=True).as_quat()  # [x,y,z,w]
+    quat_mj = np.array([quat[3], quat[0], quat[1], quat[2]])
+    env.sim.data.qpos[qpos_addr + 3 : qpos_addr + 7] = quat_mj
     env.sim.forward()
+
 
     # Force camera observations to update
     for cam_name in env.camera_names:
@@ -151,139 +166,124 @@ def main():
     rgb_raw = rgb_raw.reshape(-1, 3)   # (H*W, 3)
 
     # Create mask for points with z ≤ 1
-    mask = pcd_raw[:, 2] <= 1.5
+    mask = pcd_raw[:, 2] > 0.6
 
     # Apply mask
     pcd_raw = pcd_raw[mask]
     rgb_raw = rgb_raw[mask]
     # copied directly from rlbench
-    rgb = normalize_rgb(rgb_raw[:, None]).squeeze(2).T
-    pcd = torch.from_numpy(pcd_raw).float()
-    pt_idx = sample_points(pcd_raw, 16384)
-    pcd, rgb = pcd[pt_idx], rgb[pt_idx]
-    data = {
-            'inputs': torch.cat([pcd - pcd.mean(dim=0), rgb], dim=1),
-            'points': pcd,
-            'task': 'pick'
-        }
-    print("pointcloud mean: ", pcd.mean(dim=0))
-    data['cam_pose'] = torch.from_numpy(cam_extrinsics).float()
-    # model requires these fields even for pick task (uses dummy data like M2T2 dataset.py:100-106)
-    data['object_inputs'] = torch.rand(1024, 6)
-    data['ee_pose'] = torch.eye(4)
-    data['bottom_center'] = torch.zeros(3)
-    data['object_center'] = torch.zeros(3)
+   
 
 
-    ############### ONLY OPERATE HERE ################
-    import os
-    debug_dir = "/home/maggie/research/robosuite/debug"
-    os.makedirs(debug_dir, exist_ok=True)
-    np.save(f"{debug_dir}/xyz.npy", pcd)
-    np.save(f"{debug_dir}/rgb.npy", rgb)
-    np.save(f"{debug_dir}/depth.npy", obs[f"{args.camera}_depth"])
-    np.save(f"{debug_dir}/rgb_image.npy", obs[f"{args.camera}_image"])
-    # Calculate center offset (used to center the point cloud)
-    # center_offset = pcd.mean(dim=0)
+    grasp_pose, notFound = None, True
+    while notFound:
+        rgb = normalize_rgb(rgb_raw[:, None]).squeeze(2).T
+        pcd = torch.from_numpy(pcd_raw).float()
+        pt_idx = sample_points(pcd_raw, 16384)
+        pcd, rgb = pcd[pt_idx], rgb[pt_idx]
+        data = {
+                'inputs': torch.cat([pcd - pcd.mean(dim=0), rgb], dim=1),
+                'points': pcd,
+                'task': 'pick'
+            }
+        print("pointcloud mean: ", pcd.mean(dim=0))
+        data['cam_pose'] = torch.from_numpy(cam_extrinsics).float()
+        # model requires these fields even for pick task (uses dummy data like M2T2 dataset.py:100-106)
+        data['object_inputs'] = torch.rand(1024, 6)
+        data['ee_pose'] = torch.eye(4)
+        data['bottom_center'] = torch.zeros(3)
+        data['object_center'] = torch.zeros(3)
 
-    # Batch the data
-    data_batch = m2t2.collate([data])
-    m2t2.to_gpu(data_batch)
 
-    # Create eval config with world_coord=True (since data is in world frame)
-    eval_config = OmegaConf.create({
-        'mask_thresh': 0.01,
-        'world_coord': True,  # Data is already in world frame
-        'placement_height': 0.02,
-        'object_thresh': 0.1
-    })
+        ############### ONLY OPERATE HERE ################
+        import os
+        debug_dir = "/home/maggie/research/robosuite/debug"
+        os.makedirs(debug_dir, exist_ok=True)
+        np.save(f"{debug_dir}/xyz.npy", pcd)
+        np.save(f"{debug_dir}/rgb.npy", rgb)
+        np.save(f"{debug_dir}/depth.npy", obs[f"{args.camera}_depth"])
+        np.save(f"{debug_dir}/rgb_image.npy", obs[f"{args.camera}_image"])
 
-    # Run inference
-    with torch.no_grad():
-        outputs = m2t2.model.infer(data_batch, eval_config)
+        # Batch the data
+        data_batch = m2t2.collate([data])
+        m2t2.to_gpu(data_batch)
 
-    # Move outputs to CPU
-    m2t2.to_cpu(outputs)
+        eval_config = OmegaConf.create({
+            'mask_thresh': 0.01,
+            'world_coord': True,  # Data is already in world frame
+            'placement_height': 0.02,
+            'object_thresh': 0.1
+        })
 
-    # Extract grasps and confidences from nested structure
-    # Structure: outputs['grasps'][batch_idx][object_idx] -> (N_grasps, 4, 4)
-    #           outputs['grasp_confidence'][batch_idx][object_idx] -> (N_grasps,)
-    all_grasps = []
-    all_confidences = []
-
-    if 'grasps' in outputs and 'grasp_confidence' in outputs:
-        grasps_list = outputs['grasps']
-        confs_list = outputs['grasp_confidence']
-
-        # Iterate through batch (should be 1)
-        for batch_idx in range(len(grasps_list)):
-            batch_grasps = grasps_list[batch_idx]
-            batch_confs = confs_list[batch_idx]
-
-            # Iterate through objects
-            for obj_idx in range(len(batch_grasps)):
-                obj_grasps = batch_grasps[obj_idx]
-                obj_confs = batch_confs[obj_idx]
-
-                # Extract individual grasps
-                if torch.is_tensor(obj_grasps) and obj_grasps.shape[0] > 0:
-                    for i in range(obj_grasps.shape[0]):
-                        grasp = obj_grasps[i].detach().cpu().numpy()
-                        conf = obj_confs[i].item() if torch.is_tensor(obj_confs[i]) else obj_confs[i]
-
-                        # Filter by confidence threshold
-                        if conf >= 0.01:
-                            all_grasps.append(grasp)
-                            all_confidences.append(conf)
-
-    # Select best grasp (highest confidence)
-    if len(all_grasps) > 0:
-        best_idx = np.argmax(all_confidences)
-        grasp_pose = all_grasps[best_idx].copy()
-        print("for maggie: ", grasp_pose[:3, 3])
-        # grasp_pose = cam_extrinsics @ grasp_pose
+        # running in
     
-        confidence = all_confidences[best_idx]
+        with torch.no_grad():
+            outputs = m2t2.model.infer(data_batch, eval_config)
 
-        # Transform from centered world frame to actual world frame
-        # Add center_offset to translation component
-        # print("Center offset:", center_offset)
-        # grasp_pose[:3, 3] += center_offset.cpu().numpy()
+        m2t2.to_cpu(outputs)
+        all_grasps = []
+        all_confidences = []
 
-        print(f"\n✓ Found {len(all_grasps)} grasps, selected best with confidence: {confidence:.4f}")
-    else:
-        print("\n✗ No grasps found!")
-        grasp_pose = np.eye(4)
-        confidence = 0.0
+        if 'grasps' in outputs and 'grasp_confidence' in outputs:
+            grasps_list = outputs['grasps']
+            confs_list = outputs['grasp_confidence']
 
-    ############### ONLY OPERATE HERE ################
+            # Iterate through batch (should be 1)
+            for batch_idx in range(len(grasps_list)):
+                batch_grasps = grasps_list[batch_idx]
+                batch_confs = confs_list[batch_idx]
+
+                # Iterate through objects
+                for obj_idx in range(len(batch_grasps)):
+                    obj_grasps = batch_grasps[obj_idx]
+                    obj_confs = batch_confs[obj_idx]
+
+                    # Extract individual grasps
+                    if torch.is_tensor(obj_grasps) and obj_grasps.shape[0] > 0:
+                        for i in range(obj_grasps.shape[0]):
+                            grasp = obj_grasps[i].detach().cpu().numpy()
+                            conf = obj_confs[i].item() if torch.is_tensor(obj_confs[i]) else obj_confs[i]
+
+                            # Filter by confidence threshold
+                            if conf >= 0.01:
+                                all_grasps.append(grasp)
+                                all_confidences.append(conf)
+
+        # Select best grasp (highest confidence)
+        if len(all_grasps) > 0:
+            best_idx = np.argmax(all_confidences)
+            confidence = all_confidences[best_idx]
+            print(confidence)
+            if confidence > 0.9:
+                notFound = False
+                grasp_pose = all_grasps[best_idx].copy()
+                print("for maggie: ", grasp_pose[:3, 3])
+            
+                print(f"\n✓ Found {len(all_grasps)} grasps, selected best with confidence: {confidence:.4f}")
+
 
     target_pos = grasp_pose[:3, 3]
+    target_ori = grasp_pose[:3, :3]
 
     print(f"Predicted grasp pose:\n{grasp_pose}")
     print(f"Grasp confidence: {confidence:.4f}")
-
-    # target_pos[0] = 0.0  # x center
-    # target_pos[1] = 0.0  # y center
-    # target_pos[2] -= 1.1  # 9cm above cube
-
     print(f"Moving to: {target_pos}")
 
-    # Set indicator to target position
-    # env.set_indicator_pos("target", target_pos)
-
-    # Control loop - move to target position
     for step in range(500):
         ee_pos = get_ee_position(env)
+        ee_ori = get_ee_orientation(env)
 
-        # Simple proportional control
         pos_error = target_pos - ee_pos
-        action = create_osc_action(pos_error * 5.0, gripper=1)  # Open gripper
+        ori_error_mat = target_ori @ ee_ori.T
+        ori_error_quat = T.mat2quat(ori_error_mat)
+        ori_error = T.quat2axisangle(ori_error_quat)
+
+        action = create_osc_action(pos_error * 5.0, ori_error * 2.0, gripper=1)
 
         obs, reward, done, info = env.step(action)
         env.render()
 
-        if np.linalg.norm(pos_error) < 0.01:
+        if np.linalg.norm(pos_error) < 0.01 and np.linalg.norm(ori_error) < 0.1:
             print(f"Reached target at step {step}")
             break
 
