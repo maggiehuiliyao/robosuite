@@ -3,9 +3,13 @@ from torchvision import transforms
 import numpy as np
 import sys
 from pathlib import Path
+import pickle
+import shutil
+import os
 
 from omegaconf import OmegaConf
 import torch
+from pynput import keyboard
 
 from robosuite.maggie.point_cloud_utils import extract_point_cloud_from_obs, filter_point_cloud_workspace, get_table_bounds, prepare_point_cloud_for_m2t2
 from robosuite.utils.camera_utils import get_camera_extrinsic_matrix, get_camera_intrinsic_matrix, get_real_depth_map
@@ -14,8 +18,9 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 import robosuite as suite
-from robosuite.wrappers import VisualizationWrapper
 from robosuite.devices import SpaceMouse
+import xml.etree.ElementTree as ET
+from robosuite.utils.mjcf_utils import new_body, new_site
 
 normalize_rgb = transforms.Compose([
         transforms.ToTensor(),
@@ -79,6 +84,31 @@ def depth_to_xyz(depth, intrinsics):
         xyz = np.stack((X, Y, Z), axis=-1)
         return xyz
 
+def add_marker_to_model(xml):
+    root = ET.fromstring(xml)
+    worldbody = root.find("worldbody")
+    marker_body = new_body(name="marker_body", pos=(-0.03, 0.2, 0.80))
+    marker_body.append(new_site(name="marker", type="cylinder", size=[0.01, 0.0003], rgba=[0, 0, 1, 0.4]))
+    worldbody.append(marker_body)
+    return ET.tostring(root, encoding="utf8").decode("utf8")
+
+def get_next_experiment_number():
+    data_dir = "/home/maggie/research/robosuite/robosuite/maggie/data_collection"
+    if not os.path.exists(data_dir):
+        return 0
+    experiment_folders = [f for f in os.listdir(data_dir) if f.startswith("experiment_")]
+    if not experiment_folders:
+        return 0
+    numbers = [int(f.split("_")[1]) for f in experiment_folders]
+    return max(numbers) + 1
+
+def get_cube_orientation(env):
+    obj_name = 'cube_main'
+    if obj_name in env.sim.model.body_names:
+        body_id = env.sim.model.body_name2id(obj_name)
+        return env.sim.data.body_xquat[body_id].copy()
+    return None
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--robot', type=str, default='Panda')
@@ -99,35 +129,26 @@ def main():
         camera_widths=512,
         camera_depths=True,
         reward_shaping=True,
-        control_freq=20,
+        control_freq=15,
         ignore_done=True,
     )
 
-    # Add visualization wrapper with green indicator
-    # indicator_config = {
-    #     "name": "target",
-    #     "type": None,
-    #     "size": [0.02],
-    #     "rgba": [0, 1, 0, 0.7]  # Green
-    # }
+    env.set_xml_processor(processor=add_marker_to_model)
 
-
-    # yaoyao
     from robosuite.maggie.m2t2_wrapper import M2T2GraspPredictor
     m2t2 = M2T2GraspPredictor(
         checkpoint_path=args.checkpoint,
         device='cuda',
         use_language=False
     )
-    # env = VisualizationWrapper(env, indicator_configs=[])
 
     obs = env.reset()
 
     # Get joint ID for cube
     cube_joint_id = env.sim.model.joint_name2id('cube_joint0')
     qpos_addr = env.sim.model.jnt_qposadr[cube_joint_id]
-    env.sim.data.qpos[qpos_addr + 0] += 0.15   # x
-    env.sim.data.qpos[qpos_addr + 1] -= 0.1   # y
+    env.sim.data.qpos[qpos_addr + 0] -= 0.1   # x
+    env.sim.data.qpos[qpos_addr + 1] -= 0.18   # y
     angle_deg = np.random.uniform(0, 360)
     quat = R.from_euler('z', angle_deg, degrees=True).as_quat()  # [x,y,z,w]
     quat_mj = np.array([quat[3], quat[0], quat[1], quat[2]])
@@ -288,7 +309,7 @@ def main():
             break
 
     target_pos_lower = target_pos.copy()
-    target_pos_lower[2] -= 0.12
+    target_pos_lower[2] -= 0.135
 
     for step in range(200):
         ee_pos = get_ee_position(env)
@@ -314,7 +335,33 @@ def main():
         obs, reward, done, info = env.step(action)
         env.render()
 
-    # print("SpaceMouse control active (Ctrl+q to quit)...")
+    data_collection_dir = "/home/maggie/research/robosuite/robosuite/maggie/data_collection"
+    os.makedirs(data_collection_dir, exist_ok=True)
+    experiment_num = get_next_experiment_number()
+    experiment_folder = os.path.join(data_collection_dir, f"experiment_{experiment_num}")
+    os.makedirs(experiment_folder, exist_ok=True)
+
+    all_poses = []
+    all_images = []
+
+    save_flag = [False]
+    discard_flag = [False]
+
+    def on_press(key):
+        try:
+            if hasattr(key, 'char') and key.char == 's':
+                save_flag[0] = True
+            elif hasattr(key, 'char') and key.char == 'q':
+                discard_flag[0] = True
+        except AttributeError:
+            pass
+
+    listener = keyboard.Listener(on_press=on_press)
+    listener.start()
+
+    print(f"Data collection started for experiment_{experiment_num}")
+    print("Press 's' to save and exit, 'q' to discard and exit")
+
     device = SpaceMouse(env=env, pos_sensitivity = 0.35, rot_sensitivity=0.35)
     device.start_control()
 
@@ -323,6 +370,27 @@ def main():
                                 for robot in env.robots]
 
     while True:
+        cube_pos = get_cube_position(env)
+        cube_quat = get_cube_orientation(env)
+        camera_image = obs[f"{args.camera}_image"].copy()
+
+        all_poses.append({'position': cube_pos, 'quaternion': cube_quat})
+        all_images.append(camera_image)
+
+        if save_flag[0]:
+            with open(os.path.join(experiment_folder, 'poses.pkl'), 'wb') as f:
+                pickle.dump(all_poses, f)
+            np.save(os.path.join(experiment_folder, 'images.npy'), np.array(all_images))
+            print(f"Saved experiment_{experiment_num} with {len(all_poses)} steps")
+            listener.stop()
+            break
+
+        if discard_flag[0]:
+            shutil.rmtree(experiment_folder)
+            print(f"Discarded data for experiment_{experiment_num}")
+            listener.stop()
+            break
+
         input_ac_dict = device.input2action()
         if input_ac_dict is None:
             break
@@ -335,8 +403,7 @@ def main():
 
         from copy import deepcopy
 
-        action_dict = deepcopy(input_ac_dict)  # {}
-        # set arm actions
+        action_dict = deepcopy(input_ac_dict)
         for arm in active_robot.arms:
             controller_input_type = active_robot.part_controllers[arm].input_type
 
@@ -347,14 +414,13 @@ def main():
             else:
                 raise ValueError
 
-        # Maintain gripper state for each robot but only update the active robot with action
         env_action = [robot.create_action_vector(all_prev_gripper_actions[i]) for i, robot in enumerate(env.robots)]
         env_action[device.active_robot] = active_robot.create_action_vector(action_dict)
         env_action = np.concatenate(env_action)
         for gripper_ac in all_prev_gripper_actions[device.active_robot]:
             all_prev_gripper_actions[device.active_robot][gripper_ac] = action_dict[gripper_ac]
 
-        env.step(env_action)
+        obs, reward, done, info = env.step(env_action)
         env.render()
 
     env.close()
