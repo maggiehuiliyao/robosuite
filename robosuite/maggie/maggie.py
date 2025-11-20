@@ -21,6 +21,13 @@ import robosuite as suite
 from robosuite.devices import SpaceMouse
 import xml.etree.ElementTree as ET
 from robosuite.utils.mjcf_utils import new_body, new_site
+from robosuite.wrappers.visualization_wrapper import VisualizationWrapper
+
+# Import from object_centric_diffusion for data collection
+import sys
+sys.path.insert(0, '/home/maggie/research/object_centric_diffusion')
+from utils.collect_utils import collect_narr_function, save_zarr
+from utils.pose_utils import get_rel_pose
 
 normalize_rgb = transforms.Compose([
         transforms.ToTensor(),
@@ -93,13 +100,13 @@ def add_marker_to_model(xml):
     return ET.tostring(root, encoding="utf8").decode("utf8")
 
 def get_next_experiment_number():
-    data_dir = "/home/maggie/research/robosuite/robosuite/maggie/data_collection"
+    data_dir = "/home/maggie/research/object_centric_diffusion/data/maggie_block/episodes"
     if not os.path.exists(data_dir):
         return 0
-    experiment_folders = [f for f in os.listdir(data_dir) if f.startswith("experiment_")]
-    if not experiment_folders:
+    episode_folders = [f for f in os.listdir(data_dir) if f.startswith("episode_")]
+    if not episode_folders:
         return 0
-    numbers = [int(f.split("_")[1]) for f in experiment_folders]
+    numbers = [int(f.split("_")[1]) for f in episode_folders]
     return max(numbers) + 1
 
 def get_cube_orientation(env):
@@ -108,6 +115,24 @@ def get_cube_orientation(env):
         body_id = env.sim.model.body_name2id(obj_name)
         return env.sim.data.body_xquat[body_id].copy()
     return None
+
+def get_marker_pose():
+    """Get marker pose as 7D vector [x, y, z, qx, qy, qz, qw] with identity quaternion."""
+    # Marker is at fixed position (-0.03, 0.2, 0.80) with identity orientation
+    position = np.array([-0.03, 0.2, 0.80])
+    quaternion_xyzw = np.array([0.0, 0.0, 0.0, 1.0])  # identity quaternion in (x,y,z,w) format
+    return np.concatenate([position, quaternion_xyzw])
+
+def mujoco_quat_to_xyzw(quat):
+    """Convert MuJoCo quaternion (w,x,y,z) to scipy/OCD format (x,y,z,w)."""
+    return np.array([quat[1], quat[2], quat[3], quat[0]])
+
+def get_cube_pose_7d(env):
+    """Get cube pose as 7D vector [x, y, z, qx, qy, qz, qw] in OCD format."""
+    position = get_cube_position(env)
+    quat_mujoco = get_cube_orientation(env)  # (w, x, y, z)
+    quat_xyzw = mujoco_quat_to_xyzw(quat_mujoco)  # (x, y, z, w)
+    return np.concatenate([position, quat_xyzw])
 
 def main():
     parser = argparse.ArgumentParser()
@@ -134,6 +159,21 @@ def main():
     )
 
     env.set_xml_processor(processor=add_marker_to_model)
+
+    # Add gripper indicator (hidden initially, shown after grasping)
+    indicator_config = {
+        "name": "gripper_indicator",
+        "type": "cylinder",
+        "size": [0.002, 0.3],  # [radius, half-height] - 0.6m tall line
+        "rgba": [1, 0, 0, 0.5],
+        "pos": [0, 0, -10]  # Start hidden underground
+    }
+    env = VisualizationWrapper(env, indicator_configs=indicator_config)
+
+    # Disable default gripper visualization (the green line)
+    for setting in env.get_visualization_settings():
+        if 'gripper' in setting.lower():
+            env.set_visualization_setting(setting, False)
 
     from robosuite.maggie.m2t2_wrapper import M2T2GraspPredictor
     m2t2 = M2T2GraspPredictor(
@@ -335,14 +375,29 @@ def main():
         obs, reward, done, info = env.step(action)
         env.render()
 
-    data_collection_dir = "/home/maggie/research/robosuite/robosuite/maggie/data_collection"
+    # Show the gripper indicator now that we've grasped the block
+    ee_pos = get_ee_position(env)
+    if ee_pos is not None:
+        env.set_indicator_pos("gripper_indicator", [ee_pos[0], ee_pos[1], 1.11])
+
+    # Set up data collection directory in OCD format
+    data_collection_dir = "/home/maggie/research/object_centric_diffusion/data/maggie_block/episodes"
     os.makedirs(data_collection_dir, exist_ok=True)
     experiment_num = get_next_experiment_number()
-    experiment_folder = os.path.join(data_collection_dir, f"experiment_{experiment_num}")
-    os.makedirs(experiment_folder, exist_ok=True)
+    episode_folder = os.path.join(data_collection_dir, f"episode_{experiment_num}")
+    os.makedirs(episode_folder, exist_ok=True)
 
-    all_poses = []
-    all_images = []
+    # Initialize poses_dict for OCD format
+    poses_dict = {
+        "task_stage": [],
+        "grasp_obj_pose": [],
+        "grasp_obj_pose_relative_to_target": [],
+        "target_obj_pose": [],
+        "keypoint": [],
+    }
+
+    # Get marker (target) pose once - it's static
+    target_pose = get_marker_pose()
 
     save_flag = [False]
     discard_flag = [False]
@@ -359,7 +414,7 @@ def main():
     listener = keyboard.Listener(on_press=on_press)
     listener.start()
 
-    print(f"Data collection started for experiment_{experiment_num}")
+    print(f"Data collection started for episode_{experiment_num}")
     print("Press 's' to save and exit, 'q' to discard and exit")
 
     device = SpaceMouse(env=env, pos_sensitivity = 0.35, rot_sensitivity=0.35)
@@ -370,24 +425,72 @@ def main():
                                 for robot in env.robots]
 
     while True:
-        cube_pos = get_cube_position(env)
-        cube_quat = get_cube_orientation(env)
-        camera_image = obs[f"{args.camera}_image"].copy()
+        # Update gripper indicator position
+        ee_pos = get_ee_position(env)
+        if ee_pos is not None:
+            env.set_indicator_pos("gripper_indicator", [ee_pos[0], ee_pos[1], 1.11])
 
-        all_poses.append({'position': cube_pos, 'quaternion': cube_quat})
-        all_images.append(camera_image)
+        # Get cube pose in OCD format (7D with xyzw quaternion)
+        grasp_pose = get_cube_pose_7d(env)
+
+        # Compute relative pose (grasp object relative to target)
+        relative_pose = get_rel_pose(target_pose, grasp_pose)
+
+        # Append to poses_dict
+        poses_dict["task_stage"].append(0)  # single-stage task
+        poses_dict["grasp_obj_pose"].append(grasp_pose)
+        poses_dict["grasp_obj_pose_relative_to_target"].append(relative_pose)
+        poses_dict["target_obj_pose"].append(target_pose)
 
         if save_flag[0]:
-            with open(os.path.join(experiment_folder, 'poses.pkl'), 'wb') as f:
-                pickle.dump(all_poses, f)
-            np.save(os.path.join(experiment_folder, 'images.npy'), np.array(all_images))
-            print(f"Saved experiment_{experiment_num} with {len(all_poses)} steps")
+            # Process the episode using OCD's collect_narr_function
+            if len(poses_dict["grasp_obj_pose"]) < 3:
+                print("Not enough frames collected (need at least 3). Discarding.")
+                shutil.rmtree(episode_folder)
+            else:
+                arrays_dict_list, total_count_list = collect_narr_function([poses_dict], None)
+
+                # Extract arrays from the result (single episode)
+                arrays_dict = arrays_dict_list[0]
+                total_count = total_count_list[0]
+
+                # Prepare arrays for save_zarr
+                state_arrays = arrays_dict["state"]
+                state_in_world_arrays = arrays_dict["state_in_world"]
+                state_next_arrays = arrays_dict["state_next"]
+                state_next_in_world_arrays = arrays_dict["state_next_in_world"]
+                goal_arrays = arrays_dict["goal"]
+                action_arrays = arrays_dict["action"]
+                progress_arrays = arrays_dict["progress"]
+                progress_binary_arrays = arrays_dict["progress_binary"]
+                task_stage_arrays = [np.array([s]) for s in arrays_dict["task_stage"]]
+                variation_arrays = [np.array([0]) for _ in range(len(action_arrays))]  # variation = 0
+                episode_ends_arrays = [total_count]  # single episode
+
+                # Save to zarr format
+                save_dir = os.path.join(episode_folder, "zarr")
+                save_zarr(
+                    save_dir,
+                    state_arrays,
+                    state_in_world_arrays,
+                    state_next_arrays,
+                    state_next_in_world_arrays,
+                    goal_arrays,
+                    action_arrays,
+                    progress_arrays,
+                    progress_binary_arrays,
+                    task_stage_arrays,
+                    variation_arrays,
+                    episode_ends_arrays,
+                )
+                print(f"Saved episode_{experiment_num} with {total_count} keyframes (from {len(poses_dict['grasp_obj_pose'])} raw frames)")
+
             listener.stop()
             break
 
         if discard_flag[0]:
-            shutil.rmtree(experiment_folder)
-            print(f"Discarded data for experiment_{experiment_num}")
+            shutil.rmtree(episode_folder)
+            print(f"Discarded data for episode_{experiment_num}")
             listener.stop()
             break
 

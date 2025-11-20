@@ -32,11 +32,8 @@ class M2T2GraspPredictor:
 
         checkpoint = torch.load(self.checkpoint_path, map_location=self.device)
 
-        try:
-            import m2t2
-            m2t2_dir = Path(m2t2.__file__).parent.parent
-        except:
-            raise ImportError("Could not find M2T2 installation directory")
+        # Use the M2T2 source directory for config files
+        m2t2_dir = Path('/home/maggie/research/M2T2')
 
         # Auto-detect checkpoint type by checking for language-specific keys
         checkpoint_keys = set(checkpoint['model'].keys())
